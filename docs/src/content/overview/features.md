@@ -328,6 +328,45 @@ updated in a similar way.
 You can turn off this behaviour by setting the `server_replay_refresh` option to
 `false`.
 
+### Reconstructing responses from 200/304 recordings
+
+Some saved conversations cannot be recorded again and contain both a complete
+`200 OK` response to a GET request and one or more later `304 Not Modified`
+responses issued for conditional requests against the same resource. Replayed
+as-is, the bodyless 304s are useless for clients that start with an empty
+cache. Setting the `server_replay_reconstruct` option to `true` lets mitmproxy
+reconstruct replayable entities when the recording is loaded:
+
+- recorded GET flows are ordered by their response completion time, and every
+  304 is associated only with a complete 200 entity (or an already confirmed
+  validation chain) recorded *earlier*;
+- the association is confirmed through the recorded request's
+  `If-None-Match`/`If-Modified-Since` headers, the validators on the
+  responses (`ETag`/`Last-Modified`), and the `Vary` header, so different
+  languages, encodings or other negotiated variants are never mixed;
+- metadata that a 304 is allowed to update (e.g. `Cache-Control` and
+  `Expires`) is merged onto the 200 entity, while representation headers such
+  as `Content-Encoding`, `Content-Language`, `Content-Type` and `Vary` remain
+  those of the stored body.
+
+When such an entity is replayed, mitmproxy answers with the entity body or a
+304 depending on the current client's conditional headers. The entity's
+`Last-Modified` header is kept as recorded instead of being shifted by
+response refreshing; all other refresh behaviour (including `Date`,
+`Expires` and cookie expiration) is unchanged. A 200 that has already been
+replayed still backs later 304 records, but it never re-enters the pending
+replay queue, and responses belonging to a different `Vary` variant are not
+consumed by a request that selects another variant.
+
+Reconstruction only applies to GET flows. A record is skipped (with a log
+message stating the reason) when there is no earlier complete entity, a
+response completion timestamp is missing, the validators conflict, or the
+response carries `Vary: *`. Bodies are never borrowed from later records and
+mitmproxy never contacts the origin server to fill gaps. A skipped 304 is
+replayed unchanged, exactly as without the option. The feature is disabled by
+default; with `server_replay_reconstruct` unset or set to `false`, server
+replay behaves exactly as described above.
+
 ## Sticky auth
 
 The `stickyauth` option is analogous to the sticky cookie option, in that HTTP

@@ -65,6 +65,7 @@ export interface OptionsState {
     server_replay_ignore_port: boolean;
     server_replay_kill_extra: boolean;
     server_replay_nopop: boolean;
+    server_replay_reconstruct: boolean;
     server_replay_refresh: boolean;
     server_replay_reuse: boolean;
     server_replay_use_headers: string[];
@@ -173,6 +174,7 @@ export const defaultState: OptionsState = {
     server_replay_ignore_port: false,
     server_replay_kill_extra: false,
     server_replay_nopop: false,
+    server_replay_reconstruct: false,
     server_replay_refresh: true,
     server_replay_reuse: false,
     server_replay_use_headers: [],
