@@ -53,6 +53,36 @@ def tstore(tdata):
     )
 
 
+def _make_custom_cert_pem(
+    path: Path, cn: str, *sans: str
+) -> tuple[Path, rsa.RSAPrivateKey, x509.Certificate]:
+    """Write a self-signed leaf certificate with its key as a PEM file."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]),
+            critical=False,
+        )
+        .sign(private_key=key, algorithm=hashes.SHA256())
+    )
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ) + cert.public_bytes(serialization.Encoding.PEM)
+    path.write_bytes(pem)
+    return path, key, cert
+
+
 class TestCertStore:
     def test_create_explicit(self, tmpdir):
         ca = certs.CertStore.from_store(str(tmpdir), "test", 2048)
@@ -142,6 +172,86 @@ class TestCertStore:
     )
     def test_asterisk_forms(self, input, output):
         assert certs.CertStore.asterisk_forms(input) == output
+
+    def test_load_cert_file_does_not_modify_store(self, tstore, tmp_path):
+        path, _, cert = _make_custom_cert_pem(
+            tmp_path / "site.pem", "example.com", "example.com"
+        )
+        entry = tstore.load_cert_file(path)
+        assert not tstore.certs
+        assert not tstore.custom_cert_keys
+        assert entry.cert == certs.Cert(cert)
+
+        tstore.add_cert_file("example.com", path)
+        assert tstore.certs["example.com"].cert == entry.cert
+        assert tstore.custom_cert_keys == {"example.com"}
+
+    def test_replace_custom_certs(self, tstore, tmp_path):
+        path, _, cert1 = _make_custom_cert_pem(
+            tmp_path / "site.pem", "example.com", "example.com", "old.example"
+        )
+        tstore.add_cert_file("example.com", path)
+        old_entry = tstore.certs["example.com"]
+        assert tstore.get_cert("old.example", []).cert == certs.Cert(cert1)
+
+        # Renewed certificate at the same path, with a changed SAN set.
+        _, _, cert2 = _make_custom_cert_pem(
+            path, "example.com", "example.com", "new.example"
+        )
+        new_entry = tstore.load_cert_file(path)
+        tstore.replace_custom_certs([("example.com", new_entry)])
+
+        # The new group is active ...
+        assert tstore.certs["example.com"] is new_entry
+        assert tstore.get_cert("new.example", []).cert == certs.Cert(cert2)
+        assert tstore.custom_cert_keys == {"example.com", "new.example"}
+        # ... stale keys of the previous group are gone ...
+        assert "old.example" not in tstore.certs
+        assert "old.example" not in tstore.custom_cert_keys
+        # ... and the old entry object stays intact for handshakes that
+        # already picked it up.
+        assert old_entry.cert == certs.Cert(cert1)
+
+    def test_replace_custom_certs_keeps_generated_entries(self, tstore, tmp_path):
+        dummy = tstore.get_cert("dummy.example", [])
+        dummy_key = ("dummy.example", x509.GeneralNames([]))
+
+        path, _, _ = _make_custom_cert_pem(
+            tmp_path / "default.pem", "custom.example", "custom.example"
+        )
+        tstore.add_cert_file("*", path)
+        tstore.replace_custom_certs([("*", tstore.load_cert_file(path))])
+
+        # CA-signed entries cached under tuple keys are not touched (the "*"
+        # custom entry takes lookup precedence over them, which is the
+        # existing matching order).
+        assert tstore.certs[dummy_key] is dummy
+
+    def test_replace_custom_certs_empty_group(self, tstore, tmp_path):
+        path, _, _ = _make_custom_cert_pem(
+            tmp_path / "default.pem", "example.com", "example.com"
+        )
+        tstore.add_cert_file("*", path)
+        tstore.replace_custom_certs([])
+        assert not tstore.custom_cert_keys
+        assert "*" not in tstore.certs
+
+    def test_load_cert_file_error_leaves_store_unchanged(self, tstore, tdata):
+        tstore.add_cert_file(
+            "example.com",
+            Path(tdata.path("mitmproxy/net/data/verificationcerts/trusted-leaf.pem")),
+        )
+        before = dict(tstore.certs)
+        with pytest.raises(ValueError, match="do not match"):
+            tstore.load_cert_file(
+                Path(
+                    tdata.path(
+                        "mitmproxy/net/data/verificationcerts/private-public-mismatch.pem"
+                    )
+                )
+            )
+        assert tstore.certs == before
+        assert tstore.custom_cert_keys == {"example.com", "example.mitmproxy.org"}
 
 
 class TestDummyCert:

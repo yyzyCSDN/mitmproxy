@@ -14,6 +14,7 @@ from cryptography import x509
 from OpenSSL import SSL
 
 from mitmproxy import certs
+from mitmproxy import command
 from mitmproxy import connection
 from mitmproxy import ctx
 from mitmproxy import exceptions
@@ -492,28 +493,11 @@ class TlsConfig:
                     "See https://docs.mitmproxy.org/stable/concepts-certificates/ for additional help.",
                 )
 
-            for certspec in ctx.options.certs:
-                parts = certspec.split("=", 1)
-                if len(parts) == 1:
-                    parts = ["*", parts[0]]
-
-                cert = Path(parts[1]).expanduser()
-                if not cert.exists():
-                    raise exceptions.OptionsError(
-                        f"Certificate file does not exist: {cert}"
-                    )
-                try:
-                    self.certstore.add_cert_file(
-                        parts[0],
-                        cert,
-                        passphrase=ctx.options.cert_passphrase.encode("utf8")
-                        if ctx.options.cert_passphrase
-                        else None,
-                    )
-                except ValueError as e:
-                    raise exceptions.OptionsError(
-                        f"Invalid certificate format for {cert}: {e}"
-                    ) from e
+            try:
+                custom_certs = self._read_custom_certs()
+            except (OSError, ValueError) as e:
+                raise exceptions.OptionsError(str(e)) from e
+            self.certstore.replace_custom_certs(custom_certs)
 
         if "tls_ecdh_curve_client" in updated or "tls_ecdh_curve_server" in updated:
             for ecdh_curve in [
@@ -537,6 +521,80 @@ class TlsConfig:
             self._warn_seclevel_missing("client")
         if "tls_version_server_min" in updated or "ciphers_server" in updated:
             self._warn_seclevel_missing("server")
+
+    def _custom_cert_specs(self) -> list[tuple[str, Path]]:
+        """Parse the `certs` option into (matching spec, expanded file path)."""
+        specs: list[tuple[str, Path]] = []
+        for certspec in ctx.options.certs:
+            domain, sep, path = certspec.partition("=")
+            if not sep:
+                domain, path = "*", domain
+            specs.append((domain, Path(path).expanduser()))
+        return specs
+
+    def _read_custom_certs(self) -> list[tuple[str, certs.CertStoreEntry]]:
+        """
+        Read and validate all certificates configured through the `certs`
+        option from their current paths without modifying the certstore.
+        Either all files are read and decrypted successfully, or an exception
+        is raised and no state changes, which lets the caller keep using the
+        previously loaded group.
+        """
+        passphrase = (
+            ctx.options.cert_passphrase.encode("utf8")
+            if ctx.options.cert_passphrase
+            else None
+        )
+        entries: list[tuple[str, certs.CertStoreEntry]] = []
+        for spec, path in self._custom_cert_specs():
+            if not path.exists():
+                raise FileNotFoundError(f"Certificate file does not exist: {path}")
+            try:
+                entry = self.certstore.load_cert_file(path, passphrase)
+            except ValueError as e:
+                raise ValueError(f"Invalid certificate format for {path}: {e}") from e
+            entries.append((spec, entry))
+        return entries
+
+    @command.command("tls.reload_certs")
+    def reload_certs(self) -> None:
+        """
+        Reload custom site certificates from their current file paths.
+
+        Re-reads every certificate configured through the `certs` option,
+        along with its private key and certificate chain. The complete group
+        is read and validated first and only then swapped in atomically: if a
+        file is missing or unreadable, a private key cannot be decrypted, or a
+        key does not match its certificate, the previously loaded certificates
+        stay in effect and the next handshake never sees a half-updated group.
+
+        After a successful reload, new handshakes use the new certificates.
+        Handshakes and connections that have already picked up a certificate
+        context keep completing with the previous material; no connection is
+        closed. The proxy CA, upstream trust settings and client certificates
+        are not affected.
+        """
+        try:
+            entries = self._read_custom_certs()
+        except (OSError, ValueError) as e:
+            raise exceptions.CommandError(
+                f"TLS certificate reload failed, continuing to use the "
+                f"previously loaded certificates: {e}"
+            ) from e
+
+        self.certstore.replace_custom_certs(entries)
+        # SSL contexts for client <-> proxy connections are cached by chain
+        # file path and hold the chain previously read from disk. The cached
+        # contexts must switch together with the entries, otherwise a new
+        # leaf certificate could be paired with an old chain. Contexts already
+        # referenced by an existing SSL connection keep working unchanged.
+        net_tls.create_client_proxy_context.cache_clear()
+
+        logger.info(
+            f"Reloaded {len(entries)} custom TLS certificate(s) from disk. "
+            "New handshakes use the new material; established connections "
+            "continue with the certificates they already picked up."
+        )
 
     def _warn_unsupported_version(self, attribute: str, warn_unbound: bool):
         val = net_tls.Version[getattr(ctx.options, attribute)]

@@ -456,6 +456,10 @@ class CertStore:
     dhparams: DHParams
     certs: dict[TCertId, CertStoreEntry]
     expire_queue: list[CertStoreEntry]
+    # Keys in `certs` that belong to manually configured certificates (the
+    # `certs` option), as opposed to CA-signed certificates generated on the
+    # fly. Used for atomically reloading the custom certificates.
+    custom_cert_keys: set[str]
 
     def __init__(
         self,
@@ -482,6 +486,7 @@ class CertStore:
         self.dhparams = dhparams
         self.certs = {}
         self.expire_queue = []
+        self.custom_cert_keys = set()
 
     def expire(self, entry: CertStoreEntry) -> None:
         self.expire_queue.append(entry)
@@ -614,9 +619,18 @@ class CertStore:
 
         (path / f"{basename}-dhparam.pem").write_bytes(DEFAULT_DHPARAM)
 
-    def add_cert_file(
-        self, spec: str, path: Path, passphrase: bytes | None = None
-    ) -> None:
+    def load_cert_file(
+        self, path: Path, passphrase: bytes | None = None
+    ) -> CertStoreEntry:
+        """
+        Read a custom leaf certificate, its private key and certificate chain
+        from a PEM file and validate them. The store is not modified, so this
+        can be used to read and validate a whole group of files before swapping
+        it in atomically through :meth:`replace_custom_certs`.
+
+        Raises OSError if the file cannot be read and ValueError if the key
+        cannot be decrypted or does not match the certificate.
+        """
         raw = path.read_bytes()
         cert = Cert.from_pem(raw)
         try:
@@ -647,7 +661,48 @@ class CertStore:
                 f"This indicates a misconfiguration, see https://docs.mitmproxy.org/stable/concepts-certificates/."
             )
 
-        self.add_cert(CertStoreEntry(cert, private_key, path, chain), spec)
+        return CertStoreEntry(cert, private_key, path, chain)
+
+    def add_cert_file(
+        self, spec: str, path: Path, passphrase: bytes | None = None
+    ) -> None:
+        entry = self.load_cert_file(path, passphrase)
+        self.add_cert(entry, spec)
+        self.custom_cert_keys.update(self._custom_entry_keys(entry, spec))
+
+    @staticmethod
+    def _custom_entry_keys(entry: CertStoreEntry, *names: str) -> set[str]:
+        """All lookup keys under which a custom cert entry is registered."""
+        keys = set(names)
+        if entry.cert.cn:
+            keys.add(entry.cert.cn)
+        for i in entry.cert.altnames:
+            keys.add(str(i.value))
+        return keys
+
+    def replace_custom_certs(
+        self, entries: Iterable[tuple[str, CertStoreEntry]]
+    ) -> None:
+        """
+        Atomically replace all custom (manually configured) certificates with
+        the given ``(spec, entry)`` pairs. All entries must have been read and
+        validated beforehand, so that either the whole group is replaced or the
+        store is left untouched.
+
+        Certificates signed by the proxy CA are generated lazily and cached
+        under different keys, they keep working unchanged. Handshakes that
+        already hold a reference to an old entry continue to use it.
+        """
+        entries = list(entries)
+        new_keys: set[str] = set()
+        for spec, entry in entries:
+            new_keys.update(self._custom_entry_keys(entry, spec))
+
+        for key in self.custom_cert_keys:
+            self.certs.pop(key, None)
+        for spec, entry in entries:
+            self.add_cert(entry, spec)
+        self.custom_cert_keys = new_keys
 
     def add_cert(self, entry: CertStoreEntry, *names: str) -> None:
         """

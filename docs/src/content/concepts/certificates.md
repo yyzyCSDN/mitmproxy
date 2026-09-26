@@ -163,6 +163,38 @@ mitmproxy --certs *.example.com=cert.pem
 **Note:** `*.example.com` is for all the subdomains. You can also use
 `www.example.com` for a particular subdomain.
 
+### Reloading custom certificates
+
+When you renew or replace a custom certificate, you can make mitmproxy pick up
+the new files without changing the `certs` option or restarting the proxy by
+running the `tls.reload_certs` command (type `:tls.reload_certs` in
+mitmproxy's console prompt, or invoke it through the commands API):
+
+```
+:tls.reload_certs
+```
+
+The command re-reads every file configured through `certs` from its current
+path, including the leaf certificate, its private key and the certificate
+chain. All files are read and validated first and are only then swapped in
+atomically:
+
+- If any file is missing, a private key cannot be decrypted (for example with a
+  changed `cert_passphrase`), or a certificate and its private key do not
+  match, the reload fails and mitmproxy keeps serving the previously loaded
+  certificates. The next handshake never sees a partially updated group. Fix
+  the files and run `tls.reload_certs` again.
+- After a successful reload, handshakes that have not yet picked up a
+  certificate use the new material. Handshakes in progress and already
+  established connections keep using the previous certificates and are not
+  closed.
+- The domain, wildcard and default (`*`) matching rules are taken unchanged
+  from the current `certs` configuration, and domains without a custom
+  certificate continue to use certificates signed by the mitmproxy CA.
+- Only custom site certificates for ordinary TLS are reloaded. The proxy CA is
+  not rotated, and upstream trust settings and client certificates are not
+  changed.
+
 ## Using a custom certificate authority
 
 By default, mitmproxy will use `~/.mitmproxy/mitmproxy-ca.pem` as the

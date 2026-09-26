@@ -1,3 +1,5 @@
+import datetime
+import hashlib
 import ipaddress
 import logging
 import ssl
@@ -6,10 +8,15 @@ from pathlib import Path
 
 import pytest
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509 import NameOID
 from OpenSSL import SSL
 
 from mitmproxy import certs
 from mitmproxy import connection
+from mitmproxy import exceptions
 from mitmproxy import options
 from mitmproxy import tls
 from mitmproxy.addons import tlsconfig
@@ -70,6 +77,105 @@ def test_alpn_select_callback():
 here = Path(__file__).parent
 
 
+def _generate_ca(
+    cn: str,
+) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None),
+            critical=True,
+        )
+        .sign(private_key=key, algorithm=hashes.SHA256())
+    )
+    return key, cert
+
+
+def _generate_leaf(
+    cn: str,
+    *sans: str,
+    issuer: tuple[rsa.RSAPrivateKey, x509.Certificate] | None = None,
+    key_password: bytes | None = None,
+) -> tuple[rsa.RSAPrivateKey, x509.Certificate, bytes]:
+    """Generate a leaf certificate and return key, cert and PEM (key + cert)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    issuer_key, issuer_cert = issuer or (None, None)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer_cert.subject if issuer_cert else subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]),
+            critical=False,
+        )
+        .sign(private_key=issuer_key or key, algorithm=hashes.SHA256())
+    )
+    encryption = (
+        serialization.BestAvailableEncryption(key_password)
+        if key_password
+        else serialization.NoEncryption()
+    )
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption,
+    ) + cert.public_bytes(serialization.Encoding.PEM)
+    return key, cert, pem
+
+
+def _fingerprint(cert: x509.Certificate) -> bytes:
+    return cert.fingerprint(hashes.SHA256())
+
+
+class _BioSSL:
+    """Minimal stand-in for test_tls.SSLTest around a custom SSL object."""
+
+    def __init__(self, ssl_obj, inc: ssl.MemoryBIO, out: ssl.MemoryBIO):
+        self.obj = ssl_obj
+        self._inc = inc
+        self._out = out
+
+    def bio_write(self, buf: bytes) -> int:
+        return self._inc.write(buf)
+
+    def bio_read(self, bufsize: int = 65536) -> bytes:
+        return self._out.read(bufsize)
+
+    def do_handshake(self) -> None:
+        return self.obj.do_handshake()
+
+
+def _unverified_client() -> _BioSSL:
+    """A TLS client that does not verify the server certificate."""
+    client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_ctx.check_hostname = False
+    client_ctx.verify_mode = ssl.CERT_NONE
+    inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client_obj = client_ctx.wrap_bio(inc, out, server_hostname=None)
+    return _BioSSL(client_obj, inc, out)
+
+
+def _peer_fingerprint(ssl_test: test_tls.SSLTest | _BioSSL) -> bytes:
+    der = ssl_test.obj.getpeercert(binary_form=True)
+    assert der
+    return hashlib.sha256(der).digest()
+
+
 def _ctx(opts: options.Options) -> context.Context:
     return context.Context(
         connection.Client(
@@ -109,6 +215,261 @@ class TestTlsConfig:
                 ],
             )
             assert ta.certstore.certs
+
+    def test_reload_certs(self, tmp_path):
+        assert tlsconfig.TlsConfig.reload_certs.command_name == "tls.reload_certs"
+
+        exact_file = tmp_path / "exact.pem"
+        wildcard_file = tmp_path / "wildcard.pem"
+        _, exact1, exact_pem1 = _generate_leaf("example.com", "example.com")
+        _, wild1, wild_pem1 = _generate_leaf("wild.example.org", "wild.example.org")
+        exact_file.write_bytes(exact_pem1)
+        wildcard_file.write_bytes(wild_pem1)
+
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                confdir=str(tmp_path / "confdir"),
+                certs=[
+                    f"example.com={exact_file}",
+                    f"*.example.org={wildcard_file}",
+                ],
+            )
+            default_ca = ta.certstore.default_ca
+            default_key = ta.certstore.default_privatekey
+
+            def lookup(name: str) -> certs.CertStoreEntry:
+                return ta.certstore.get_cert(name, [x509.DNSName(name)])
+
+            assert lookup("example.com").cert.fingerprint() == _fingerprint(exact1)
+            assert lookup("www.example.org").cert.fingerprint() == _fingerprint(wild1)
+            # Domains without a custom certificate keep using the proxy CA.
+            assert lookup("www.example.net").privatekey is default_key
+
+            # Renew both certificates in place, paths stay unchanged.
+            _, exact2, exact_pem2 = _generate_leaf("example.com", "example.com")
+            _, wild2, wild_pem2 = _generate_leaf("wild.example.org", "wild.example.org")
+            exact_file.write_bytes(exact_pem2)
+            wildcard_file.write_bytes(wild_pem2)
+            ta.reload_certs()
+
+            assert lookup("example.com").cert.fingerprint() == _fingerprint(exact2)
+            assert lookup("www.example.org").cert.fingerprint() == _fingerprint(wild2)
+            assert lookup("www.example.net").privatekey is default_key
+            # The proxy CA is not rotated and old keys do not linger.
+            assert ta.certstore.default_ca is default_ca
+            assert ta.certstore.certs["example.com"].cert.fingerprint() != _fingerprint(
+                exact1
+            )
+
+    @pytest.mark.parametrize("failure", ["mismatch", "missing", "encryption"])
+    def test_reload_certs_failure_keeps_old_certs(self, tmp_path, tdata, failure):
+        cert_file = tmp_path / "site.pem"
+        password = b"secret" if failure == "encryption" else None
+        _, cert1, pem1 = _generate_leaf(
+            "example.com", "example.com", key_password=password
+        )
+        cert_file.write_bytes(pem1)
+
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                confdir=str(tmp_path / "confdir"),
+                certs=[f"example.com={cert_file}"],
+                cert_passphrase="secret" if failure == "encryption" else None,
+            )
+
+            def current() -> certs.CertStoreEntry:
+                return ta.certstore.get_cert(
+                    "example.com", [x509.DNSName("example.com")]
+                )
+
+            assert current().cert.fingerprint() == _fingerprint(cert1)
+
+            if failure == "mismatch":
+                cert_file.write_bytes(
+                    Path(
+                        tdata.path(
+                            "mitmproxy/net/data/verificationcerts/private-public-mismatch.pem"
+                        )
+                    ).read_bytes()
+                )
+            elif failure == "missing":
+                cert_file.unlink()
+            else:
+                _, _, pem_bad = _generate_leaf(
+                    "example.com",
+                    "example.com",
+                    key_password=b"this-is-not-the-configured-passphrase",
+                )
+                cert_file.write_bytes(pem_bad)
+
+            with pytest.raises(exceptions.CommandError, match="reload failed"):
+                ta.reload_certs()
+
+            # The whole old group remains in effect.
+            assert current().cert.fingerprint() == _fingerprint(cert1)
+
+            # Fix the file and reload again: this time it succeeds.
+            _, cert2, pem2 = _generate_leaf(
+                "example.com", "example.com", key_password=password
+            )
+            cert_file.write_bytes(pem2)
+            ta.reload_certs()
+            assert current().cert.fingerprint() == _fingerprint(cert2)
+
+    def test_reload_certs_group_atomicity(self, tmp_path, tdata):
+        file_a = tmp_path / "a.pem"
+        file_b = tmp_path / "b.pem"
+        _, cert_a1, pem_a1 = _generate_leaf("a.example", "a.example")
+        _, cert_b1, pem_b1 = _generate_leaf("b.example", "b.example")
+        file_a.write_bytes(pem_a1)
+        file_b.write_bytes(pem_b1)
+
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                confdir=str(tmp_path / "confdir"),
+                certs=[f"a.example={file_a}", f"b.example={file_b}"],
+            )
+
+            def lookup(name: str) -> certs.CertStoreEntry:
+                return ta.certstore.get_cert(name, [x509.DNSName(name)])
+
+            def client_tls_start(sni: str):
+                ctx = _ctx(tctx.options)
+                ctx.client.sni = sni
+                tls_start = tls.TlsData(ctx.client, context=ctx)
+                ta.tls_start_client(tls_start)
+                return tls_start
+
+            tls_start_before = client_tls_start("a.example")
+            ssl_ctx_before = tls_start_before.ssl_conn.get_context()
+
+            # Disk is now half renewed (a) and half broken (b).
+            _, cert_a2, pem_a2 = _generate_leaf("a.example", "a.example")
+            file_a.write_bytes(pem_a2)
+            file_b.write_bytes(
+                Path(
+                    tdata.path(
+                        "mitmproxy/net/data/verificationcerts/private-public-mismatch.pem"
+                    )
+                ).read_bytes()
+            )
+
+            with pytest.raises(exceptions.CommandError):
+                ta.reload_certs()
+
+            # No handshake may see the renewed a while b is broken.
+            assert lookup("a.example").cert.fingerprint() == _fingerprint(cert_a1)
+            assert lookup("b.example").cert.fingerprint() == _fingerprint(cert_b1)
+            # The path-cached SSL context is retained as well.
+            assert (
+                client_tls_start("a.example").ssl_conn.get_context() is ssl_ctx_before
+            )
+
+            # Repair b and reload again -> both new groups become visible.
+            _, cert_b2, pem_b2 = _generate_leaf("b.example", "b.example")
+            file_b.write_bytes(pem_b2)
+            ta.reload_certs()
+            assert lookup("a.example").cert.fingerprint() == _fingerprint(cert_a2)
+            assert lookup("b.example").cert.fingerprint() == _fingerprint(cert_b2)
+            assert (
+                client_tls_start("a.example").ssl_conn.get_context()
+                is not ssl_ctx_before
+            )
+
+    def test_reload_certs_chain_and_context_switch(self, tmp_path):
+        cert_file = tmp_path / "site.pem"
+        _, cert1, pem1 = _generate_leaf("example.com", "example.com")
+        cert_file.write_bytes(pem1)
+
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                confdir=str(tmp_path / "confdir"),
+                certs=[f"example.com={cert_file}"],
+            )
+
+            ctx = _ctx(tctx.options)
+            ctx.client.sni = "example.com"
+            tls_start1 = tls.TlsData(ctx.client, context=ctx)
+            ta.tls_start_client(tls_start1)
+            ssl_ctx1 = tls_start1.ssl_conn.get_context()
+            assert len(ta.certstore.certs["example.com"].chain_certs) == 1
+
+            # Renew with a leaf signed by an intermediate, chain appended.
+            intermediate_key, intermediate_cert = _generate_ca("Example Intermediate")
+            _, cert2, leaf_pem2 = _generate_leaf(
+                "example.com",
+                "example.com",
+                issuer=(intermediate_key, intermediate_cert),
+            )
+            intermediate_pem = intermediate_cert.public_bytes(
+                serialization.Encoding.PEM
+            )
+            cert_file.write_bytes(leaf_pem2 + intermediate_pem)
+            ta.reload_certs()
+
+            entry2 = ta.certstore.certs["example.com"]
+            assert entry2.cert.fingerprint() == _fingerprint(cert2)
+            assert len(entry2.chain_certs) == 2
+            # The contexts cached by chain file path switched together.
+            assert net_tls.create_client_proxy_context.cache_info().currsize == 0
+
+            ctx2 = _ctx(tctx.options)
+            ctx2.client.sni = "example.com"
+            tls_start2 = tls.TlsData(ctx2.client, context=ctx2)
+            ta.tls_start_client(tls_start2)
+            ssl_conn2 = tls_start2.ssl_conn
+            assert ssl_conn2.get_context() is not ssl_ctx1
+
+            # A client trusting only the new intermediate completes the
+            # handshake, proving the new chain is actually served.
+            client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            client_ctx.load_verify_locations(cadata=intermediate_pem.decode())
+            inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
+            client_obj = client_ctx.wrap_bio(inc, out, server_hostname="example.com")
+            assert self.do_handshake(_BioSSL(client_obj, inc, out), ssl_conn2)
+
+    def test_reload_certs_connection_switch(self, tmp_path):
+        cert_file = tmp_path / "site.pem"
+        _, cert1, pem1 = _generate_leaf("example.com", "example.com")
+        cert_file.write_bytes(pem1)
+
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                confdir=str(tmp_path / "confdir"),
+                certs=[f"*={cert_file}"],
+            )
+
+            # This handshake picks up its certificate context before the reload.
+            ctx1 = _ctx(tctx.options)
+            tls_start1 = tls.TlsData(ctx1.client, context=ctx1)
+            ta.tls_start_client(tls_start1)
+
+            _, cert2, pem2 = _generate_leaf("example.com", "example.com")
+            cert_file.write_bytes(pem2)
+            ta.reload_certs()
+
+            # It completes after the reload with the old material.
+            client1 = _unverified_client()
+            assert self.do_handshake(client1, tls_start1.ssl_conn)
+            assert _peer_fingerprint(client1) == _fingerprint(cert1)
+
+            # A fresh handshake after the reload uses the new material.
+            ctx2 = _ctx(tctx.options)
+            tls_start2 = tls.TlsData(ctx2.client, context=ctx2)
+            ta.tls_start_client(tls_start2)
+            client2 = _unverified_client()
+            assert self.do_handshake(client2, tls_start2.ssl_conn)
+            assert _peer_fingerprint(client2) == _fingerprint(cert2)
 
     def test_configure_tls_version(self, caplog):
         caplog.set_level(logging.INFO)

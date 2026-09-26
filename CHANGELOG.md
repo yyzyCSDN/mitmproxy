@@ -7,6 +7,10 @@
 
 ## Unreleased: mitmproxy next
 
+- Add a `tls.reload_certs` command that atomically re-reads the custom site
+  certificates configured through `certs` (leaf certificate, private key and
+  chain) from their current file paths, so renewed certificates can be picked
+  up without restarting the proxy.
 - Replace deprecated pyparsing APIs with their snake_case equivalents to avoid
   `PyparsingDeprecationWarning` during command and flow-filter parsing.
   ([#8344](https://github.com/mitmproxy/mitmproxy/pull/8344), @Dnsayhey)
