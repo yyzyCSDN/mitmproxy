@@ -7,6 +7,11 @@
 
 ## Unreleased: mitmproxy next
 
+- Add a `map_local_http` option (off by default) that serves files mapped by
+  `map_local` with full HTTP semantics for GET and HEAD: ETag/Last-Modified
+  validators and conditional request headers (304/412), plus byte-range
+  support for GET including `multipart/byteranges`, so browsers can validate
+  caches, resume downloads and seek in mapped media.
 - Replace deprecated pyparsing APIs with their snake_case equivalents to avoid
   `PyparsingDeprecationWarning` during command and flow-filter parsing.
   ([#8344](https://github.com/mitmproxy/mitmproxy/pull/8344), @Dnsayhey)

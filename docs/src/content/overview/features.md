@@ -141,6 +141,50 @@ Served File:                 Preferred: <span style="color:#82b719">~/static-dir
                              Otherwise: 404 response without content
 </pre>
 
+### HTTP caching and seeking (`map_local_http`)
+
+By default, mapped files are returned as a plain `200` response on every
+request, without caching or range support. When you replace large videos or
+other static assets, browsers can therefore neither validate their cache nor
+resume interrupted downloads or seek within a mapped media file.
+
+Enable the `map_local_http` option to serve mapped `GET` and `HEAD` requests
+with standard HTTP semantics instead:
+
+* `ETag` and `Last-Modified` validators are derived from the opened file, and
+  the `If-Match`, `If-None-Match`, `If-Modified-Since`,
+  `If-Unmodified-Since` and `If-Range` preconditions are honoured
+  (`304 Not Modified`, `412 Precondition Failed`).
+* `GET` supports byte ranges: single, suffix, open-ended and
+  `multipart/byteranges` ranges, with `416 Range Not Satisfiable` for
+  unfulfillable ranges. Malformed `Range` headers or unknown range units are
+  ignored. `HEAD` always returns the full representation's headers and never a
+  body.
+* Each response opens the file once, so its validators, content length and
+  body stay consistent even if the file is replaced concurrently; the next
+  request already serves the new file.
+
+The option is off by default. When it is off, or for methods other than
+`GET` and `HEAD`, `map_local` behaves exactly as before.
+
+Example configuration in `~/.mitmproxy/config.yaml`:
+
+```yaml
+map_local:
+  - "|example.com/videos|~/videos"
+  - "|example.com/static|~/static"
+map_local_http: true
+```
+
+Equivalent command line:
+
+```
+mitmdump \
+    --map-local "|example.com/videos|~/videos" \
+    --map-local "|example.com/static|~/static" \
+    --map-local-http
+```
+
 ## Map Remote
 
 The `map_remote` option lets you specify an arbitrary number of patterns that

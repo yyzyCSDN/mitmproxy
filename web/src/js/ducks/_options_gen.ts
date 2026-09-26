@@ -38,6 +38,7 @@ export interface OptionsState {
     listen_host: string;
     listen_port: number | undefined;
     map_local: string[];
+    map_local_http: boolean;
     map_remote: string[];
     mode: string[];
     modify_body: string[];
@@ -146,6 +147,7 @@ export const defaultState: OptionsState = {
     listen_host: "",
     listen_port: undefined,
     map_local: [],
+    map_local_http: false,
     map_remote: [],
     mode: ["regular"],
     modify_body: [],
