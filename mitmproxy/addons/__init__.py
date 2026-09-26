@@ -9,6 +9,7 @@ from mitmproxy.addons import comment
 from mitmproxy.addons import core
 from mitmproxy.addons import cut
 from mitmproxy.addons import disable_h2c
+from mitmproxy.addons import dns_replay
 from mitmproxy.addons import dns_resolver
 from mitmproxy.addons import export
 from mitmproxy.addons import maplocal
@@ -50,6 +51,7 @@ def default_addons():
         proxyauth.ProxyAuth(),
         proxyserver.Proxyserver(),
         script.ScriptLoader(),
+        dns_replay.DnsReplay(),
         dns_resolver.DnsResolver(),
         next_layer.NextLayer(),
         serverplayback.ServerPlayback(),

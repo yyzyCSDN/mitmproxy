@@ -22,6 +22,8 @@ export interface OptionsState {
     console_focus_follow: boolean;
     content_view_lines_cutoff: number;
     dns_name_servers: string[];
+    dns_replay: string[];
+    dns_replay_extra: string;
     dns_use_hosts_file: boolean;
     export_preserve_original_ip: boolean;
     hardump: string;
@@ -130,6 +132,8 @@ export const defaultState: OptionsState = {
     console_focus_follow: false,
     content_view_lines_cutoff: 512,
     dns_name_servers: [],
+    dns_replay: [],
+    dns_replay_extra: "forward",
     dns_use_hosts_file: true,
     export_preserve_original_ip: false,
     hardump: "",

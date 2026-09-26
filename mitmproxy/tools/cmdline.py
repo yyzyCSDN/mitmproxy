@@ -89,6 +89,11 @@ def common_options(parser, opts):
     opts.make_parser(group, "server_replay_reuse")
     opts.make_parser(group, "server_replay_refresh")
 
+    # DNS replay
+    group = parser.add_argument_group("DNS Replay")
+    opts.make_parser(group, "dns_replay", metavar="PATH")
+    opts.make_parser(group, "dns_replay_extra")
+
     # Map Remote
     group = parser.add_argument_group("Map Remote")
     opts.make_parser(group, "map_remote", metavar="PATTERN", short="M")

@@ -1,4 +1,6 @@
 from mitmproxy import contentviews
+from mitmproxy import io
+from mitmproxy.addons import dns_replay
 from mitmproxy.http import Headers
 from mitmproxy.test import taddons
 from mitmproxy.test import tflow
@@ -61,3 +63,25 @@ class TestScripts:
             f = tflow.tflow(req=tutils.treq(host="example.com", port=80))
             sc.request(f)
             assert f.response.content == b"Hello World"
+
+    def test_dns_replay(self, tdata, tmp_path):
+        dr = dns_replay.DnsReplay()
+        with taddons.context(dr) as tctx:
+            sc = tctx.script(tdata.path("../examples/addons/dns-replay.py"))
+
+            sc.running()
+            assert tctx.options.dns_replay_extra == "refuse"
+
+            # an unreadable file does not raise and keeps the (empty) set
+            sc.dns_replay_swap("/nonexistent")
+            assert dr.count() == 0
+
+            path = tmp_path / "dns.mitm"
+            with open(path, "wb") as f:
+                io.FlowWriter(f).add(tflow.tdnsflow(resp=True))
+            sc.dns_replay_swap(str(path))
+            assert dr.count() == 1
+
+            # a failed replacement keeps the previous set
+            sc.dns_replay_swap("/nonexistent")
+            assert dr.count() == 1

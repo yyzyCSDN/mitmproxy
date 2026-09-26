@@ -7,6 +7,12 @@
 
 ## Unreleased: mitmproxy next
 
+- Add a `dns_replay` option (`--dns-replay`, `replay.dns` commands) that replays
+  recorded single-question IN-class A/AAAA DNS responses for offline testing
+  instead of running a fake DNS server. Recorded answers (including negative
+  answers) are returned verbatim with their original TTLs, oversized UDP replies
+  set the truncation bit so clients can re-query over TCP, and misses can be
+  forwarded to real resolution or answered with REFUSED.
 - Replace deprecated pyparsing APIs with their snake_case equivalents to avoid
   `PyparsingDeprecationWarning` during command and flow-filter parsing.
   ([#8344](https://github.com/mitmproxy/mitmproxy/pull/8344), @Dnsayhey)

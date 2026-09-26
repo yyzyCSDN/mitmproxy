@@ -10,7 +10,13 @@ from hypothesis import strategies as st
 from ..tutils import Placeholder
 from ..tutils import Playbook
 from ..tutils import reply
+from mitmproxy.addons import dns_replay
+from mitmproxy.dns import classes
 from mitmproxy.dns import DNSFlow
+from mitmproxy.dns import DNSMessage
+from mitmproxy.dns import Question
+from mitmproxy.dns import ResourceRecord
+from mitmproxy.dns import types
 from mitmproxy.net.dns import response_codes
 from mitmproxy.proxy.commands import CloseConnection
 from mitmproxy.proxy.commands import Log
@@ -19,6 +25,8 @@ from mitmproxy.proxy.commands import SendData
 from mitmproxy.proxy.events import ConnectionClosed
 from mitmproxy.proxy.events import DataReceived
 from mitmproxy.proxy.layers import dns
+from mitmproxy.test import taddons
+from mitmproxy.test import tflow
 from mitmproxy.test.tflow import tdnsreq
 from mitmproxy.test.tflow import tdnsresp
 from mitmproxy.test.tflow import terr
@@ -478,3 +486,60 @@ def test_invalid_tcp_message_length(tctx):
         << CloseConnection(tctx.client)
         >> ConnectionClosed(tctx.client)
     )
+
+
+def test_dns_replay_truncation_udp_then_tcp(tctx):
+    name = "many.example"
+    question = Question(name, types.A, classes.IN)
+    answers = [
+        ResourceRecord(name, types.A, classes.IN, 123, bytes([10, 0, 0, i]))
+        for i in range(40)
+    ]
+    req = tdnsreq(questions=[question])
+    resp = tdnsresp(questions=[question], answers=answers)
+
+    dr = dns_replay.DnsReplay()
+    with taddons.context(dr):
+        dr.load_flows([tflow.tdnsflow(req=req, resp=resp)])
+
+        # UDP: the oversized answer is served with the TC bit set
+        tctx.client.transport_protocol = "udp"
+        tctx.server.transport_protocol = "udp"
+        udp_data = Placeholder(bytes)
+        assert (
+            Playbook(dns.DNSLayer(tctx))
+            >> DataReceived(tctx.client, dns.pack_message(req, "udp"))
+            << dns.DnsRequestHook(Placeholder(DNSFlow))
+            >> reply(side_effect=dr.dns_request)
+            << dns.DnsResponseHook(Placeholder(DNSFlow))
+            >> reply()
+            << SendData(tctx.client, udp_data)
+            >> ConnectionClosed(tctx.client)
+            << None
+        )
+        assert len(udp_data()) <= 512
+        udp_msg = DNSMessage.unpack(udp_data())
+        assert udp_msg.truncation
+        assert udp_msg.answers == []
+
+        # TCP retry: the complete recording is served
+        tctx.client.transport_protocol = "tcp"
+        tctx.server.transport_protocol = "tcp"
+        tcp_data = Placeholder(bytes)
+        assert (
+            Playbook(dns.DNSLayer(tctx))
+            >> DataReceived(tctx.client, dns.pack_message(req, "tcp"))
+            << dns.DnsRequestHook(Placeholder(DNSFlow))
+            >> reply(side_effect=dr.dns_request)
+            << dns.DnsResponseHook(Placeholder(DNSFlow))
+            >> reply()
+            << SendData(tctx.client, tcp_data)
+            >> ConnectionClosed(tctx.client)
+            << None
+        )
+        (length,) = struct.unpack("!H", tcp_data()[:2])
+        assert length == len(tcp_data()) - 2 > 512
+        tcp_msg = DNSMessage.unpack(tcp_data()[2:])
+        assert not tcp_msg.truncation
+        assert len(tcp_msg.answers) == 40
+        assert tcp_msg.answers[-1].data == bytes([10, 0, 0, 39])
